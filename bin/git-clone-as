@@ -1,0 +1,454 @@
+#!/usr/bin/env ruby
+# frozen-string-literal: true
+
+require 'getoptlong'
+require 'pathname'
+require 'shellwords'
+
+class Pathname
+  def self.home(...) = new(Dir.home(...))
+
+  def absolute_path(*)
+    realpath(*)
+  rescue Errno::ENOENT => error
+    raise error unless block_given?
+
+    yield self
+  end
+end
+
+CLONE_OPTIONS = {
+  GetoptLong::REQUIRED_ARGUMENT => [
+    %w[reference], %w[reference-if-able], %w[server-option], %w[filter],
+    %w[origin o], %w[branch b], %w[revision], %w[upload-pack u], %w[template],
+    %w[config c], %w[depth], %w[shallow-since], %w[shallow-exclude],
+    %w[separate-git-dir], %w[ref-format], %w[jobs j], %w[bundle-uri],
+    # non-git parameters
+    %w[identities-config]
+  ],
+  GetoptLong::OPTIONAL_ARGUMENT => [
+    %w[recurse-submodules]
+  ],
+  GetoptLong::NO_ARGUMENT => [
+    %w[local l], %w[no-hardlinks], %w[shared s], %w[dissociate], %w[quiet q],
+    %w[verbose v], %w[progress], %w[no-checkout n], %w[no-reject-shallow],
+    %w[reject-shallow], %w[bare], %w[sparse], %w[also-filter-submodules],
+    %w[mirror], %w[no-single-branch], %w[single-branch], %w[no-tags], %w[tags],
+    %w[no-shallow-submodules], %w[shallow-submodules], %w[no-remote-submodules],
+    %w[remote-submodules],
+    # non-git parameters
+    %w[dry-run]
+  ]
+}.freeze
+
+# Turns
+#   { GetoptLong::REQUIRED_ARGUMENT => [%w[asd a], %w[b]] }
+# into
+#   [['--asd', '-a', GetoptLong::REQUIRED_ARGUMENT],
+#    ['-b', GetoptLong::REQUIRED_ARGUMENT ]]
+GETOPTLONG_CONF = CLONE_OPTIONS.map do |type, options|
+  options.map { |optn| optn.map { |as| "#{as.size == 1 ? '-' : '--'}#{as}" } }
+         .each_with_object(type)
+         .map(&:<<)
+         .map(&:freeze)
+end.flatten(1).freeze
+
+class GitURLParser
+  _SUBDOMAIN = '[[:alnum:]](?:[[:alnum:]-]*[[:alnum:]])?'
+  _DOMAIN = "(?<host>(?:#{_SUBDOMAIN}\\.)*(?<tld>#{_SUBDOMAIN}))"
+  _SSHUSER = '[\w.-]{3,16}'
+  _USER_AT_HOST = "(?:(?<sshuser>#{_SSHUSER})@)?#{_DOMAIN}"
+  _GITHUB_USER = '(?<user>[[:alnum:]](?:[[:alnum:]-](?=[[:alnum:]])|[[:alnum:]]){0,38})'
+  _GITHUB_PROJECT = '(?<project>[\w.-]+)'
+  _GITHUB_REPO = "(?<repository>#{_GITHUB_USER}/#{_GITHUB_PROJECT})\\.git/?"
+  _PATH = "(?<path>.+)"
+  _REPO_PATH = "(?:#{_GITHUB_REPO}|#{_PATH})"
+  _PORT = "(?::(?<port>\d+))?"
+  # REGEX = %r{\A(?<ssh>ssh://)?+#{_USER_AT_HOST}(?(<ssh>)#{_PORT}/|:/?)(?:#{_GITHUB_REPO}|#{_PATH})\z}.freeze
+  _SCP = "#{_USER_AT_HOST}:/?#{_REPO_PATH}"
+  _SSH = "(?<protocol>ssh)://#{_USER_AT_HOST}#{_PORT}/#{_REPO_PATH}"
+  _OTHER = "(?<protocol>git|https?|ftps?)://#{_DOMAIN}#{_PORT}/#{_REPO_PATH}"
+  REGEX = %r{\A(?:#{_SCP}|#{_SSH}|#{_OTHER})\z}.freeze
+
+  attr_accessor :url
+
+  def initialize(url)
+    self.url = url
+  end
+
+  # Define a bunch of reader methods.
+  %i[host path project repository user].each do |method|
+    module_eval "def #{method} = match_data[:#{method}]", __FILE__, __LINE__
+  end
+
+  def match_data
+    @match_data ||= REGEX.match(url) or raise 'not a Git URL'
+  end
+
+  def to_s = url
+end
+
+class Identity
+  Fields = %i[email file host name user].freeze
+
+  attr_reader :id, *Fields
+  alias identity_file file
+
+  def initialize(id = nil, **kwargs)
+    kwargs.each { |name, value| __send__ "#{name}=", value }
+    self.id = id || [user, host].join('@')
+  end
+
+  def matcher
+    [
+      user&.then { Matchers.user(it) },
+      host&.then { Matchers.host(it) }
+    ].compact.reduce(&:|)
+  end
+
+  def name
+    @name ||= user
+  end
+
+  private
+
+  attr_writer :id, *Fields
+
+  def file=(file)
+    @file =
+      Pathname.new(file).absolute_path { it.realpath(Pathname.home / '.ssh') }
+  end
+end
+
+class Matcher
+  attr_accessor :pattern
+
+  def initialize(pattern = nil, transform_proc: nil, &matcher)
+    self.pattern = pattern
+    transform_proc&.then { define_singleton_method(:transform, &it) }
+    matcher&.then { define_singleton_method(:match?, &it) }
+  end
+
+  def ===(other) = match?(other) || super
+
+  def |(other) = new(self) { pattern.match?(it) && other.match?(it) }
+  def +(other) = new(self) { pattern.match?(it) || other.match?(it) }
+  def -(other) = new(self) { pattern.match?(it) && !other.match?(it) }
+
+  def match?(arg) = pattern === transform(arg)
+  def new(...) = self.class.new(...)
+  def to_proc = method(:match?).to_proc
+  def transform(obj) = obj
+end
+
+module Matchers
+  extend self
+
+  # Define a bunch of matchers
+  {
+    host: :hostname,
+    path: nil,
+    project: %i[repo_name reponame],
+    repository: %i[repo_path repository_path],
+    url: nil,
+    user: :username
+  }.each do |method, aliases|
+    module_eval <<~END, __FILE__, __LINE__ + 1
+      def #{method}(#{method})
+        Matcher.new(#{method}, transform_proc: proc(&:#{method}))
+      end
+    END
+
+    [*aliases].each { module_eval "alias #{it} #{method}", __FILE__, __LINE__ }
+  end
+
+  def __default__(...) = Matcher.new { |_| true }
+end
+
+class Dispatcher
+  def call(url_data)
+    mappers.lazy.each_with_object(url_data)
+           .map(&:call).find(&:itself) or raise 'failed to match repository'
+  end
+
+  def define(matcher:, identity:)
+    mappers << ->(data) { identity if matcher.match?(data) }
+  end
+
+  private
+
+  def mappers
+    @mappers ||= []
+  end
+end
+
+class Config
+  DEFAULT_PATH = Pathname.home./('.local/share/git-clone-as/config.rb').freeze
+
+  class << self
+    def load(file) = Config.new.load(file)
+  end
+
+  def dispatcher
+    @dispatcher ||= Dispatcher.new
+  end
+
+  def match(matcher, to:)
+    identity = to.respond_to?(:identity_file) ? to : identities[to]
+    dispatcher.define(matcher:, identity:)
+  end
+
+  def identities
+    @identities ||= {}
+  end
+
+  def identity(*, define_matcher: true, **)
+    identity = Identity.new(*, **)
+    match(identity.matcher, to: identity) if define_matcher
+
+    identities[identity.id] = identity
+  end
+
+  def load(file = DEFAULT_PATH)
+    Pathname.new(file).expand_path.then do |file|
+      wrap_module.module_eval(file.read, file.to_s)
+    end
+
+    self
+  end
+
+  private
+
+  def wrap_module
+    Module.new do
+      extend Matchers
+      def self.configure = yield const_get(:CONFIGURATION)
+    end.tap do |mod|
+      mod.const_set(:CONFIGURATION, self)
+    end
+  end
+end
+
+class Environment
+  class Dry < self
+    def self.command(...) = Command::Dry.run(...)
+
+    def dry(...) = run(...) # alias doesn't work
+
+    def to_s
+      env.map { |var, value| "#{var}=#{Shellwords.shellescape(value)}" }
+         .join(' ')
+    end
+  end
+
+  class << self
+    def command(...) = Command.run(...)
+    def dry(...) = Dry.new(...)
+  end
+
+  attr_accessor :dry_keys, :env
+
+  def initialize(env = {}, dry: nil)
+    self.env = env
+    self.dry_keys = dry
+  end
+
+  def dry(...)
+    (@dry ||= self.class.dry(dry_keys ? env.slice(*dry_keys) : env))
+      .run(...)
+  end
+
+  def empty(...)
+    (@empty ||= new({})).run(...)
+  end
+
+  def empty? = env.empty?
+
+  def command(...) = self.class.command(self, ...)
+  def new(...) = self.class.new(...)
+  def none(...) = dry.empty(...)
+
+  def run(lambda = nil, &block)
+    return self unless block or lambda
+
+    command(&block || lambda)
+  end
+  alias all run
+
+  def to_h(&block)
+    return @env unless block
+
+    @env.to_h(&block)
+  end
+  alias to_hash to_h
+end
+
+class Command < BasicObject
+  class Dry < self
+    def initialize(env) = super(env.dry)
+
+    def method_missing(*args)
+      ::STDERR.print(@env.to_s, ' ') unless @env.empty?
+
+      ::STDERR.puts(::Shellwords.shelljoin(args))
+
+      true
+    end
+  end
+
+  def self.run(*args, **opts, &cmdline)
+    cmdline = args.shift unless cmdline
+
+    new(*args, **opts).__run__(&cmdline)
+  end
+
+  def initialize(env)
+    @env = env
+  end
+
+  def method_missing(*args)
+    @env.dry ->(run) { run.__send__(*args) }
+
+    ::Kernel.system(@env, *args.map(&:to_s))
+  end
+
+  def __run__(&block) = block.(self)
+end
+
+class GitCloneAs
+  def self.run(...) = new(...).run
+
+  attr_accessor :options, :url
+  attr_writer :directory
+
+  def initialize(argv, options: {})
+    self.url = argv.shift
+    self.directory = argv.shift
+    self.options = options
+
+    raise 'too many arguments on the cmdline' unless argv.empty?
+  end
+
+  def config
+    @config ||= Config.load(options_config_path)
+  end
+
+  def directory
+    @directory ||= project
+  end
+  alias target_dir directory
+
+  def dry_run?
+    @dry_run ||= options.delete('--dry-run')
+  end
+
+  def env(...)
+    (@env ||= Environment.new(add_ssh(ENV.to_h), dry: ['GIT_SSH_COMMAND'])
+                         .then do |env|
+                           next env unless dry_run?
+
+                           env.dry
+                         end).run(...)
+  end
+
+  def identity
+    @identity ||= select_identity
+  end
+
+  def project
+    @project ||= repo_data.project
+  end
+
+  def repo_data
+    @repo_data ||= GitURLParser.new(url)
+  end
+
+  # cd's to the repository dir, and fakes it in case of dry run.
+  def exec_in_repo(&block)
+    original_dir = Pathname.pwd
+
+    env.none ->(run) { run.cd target_dir }
+
+    return block.call if dry_run?
+
+    Dir.chdir(target_dir, &block)
+  ensure
+    env.none ->(run) { run.cd original_dir }
+  end
+
+  def git_clone(*args)
+    args = [url, target_dir] if args.empty?
+
+    env ->(run) { run.git 'clone', *git_options, *args }
+  end
+
+  def git_config(*args, **kvs)
+    return env.empty ->(run) { run.git 'config', *args } if kvs.empty?
+
+    unless args.empty? || kvs.empty?
+      raise ArgumentError, 'both arg list and key-value pairs given'
+    end
+
+    kvs.all? { |key, value| git_config key, value }
+  end
+
+  def git_options
+    GETOPTLONG_CONF.select { |name, *| options.key?(name) }
+                   .map! { |name, *, type| [name, options[name], type] }
+                   .map!(&method(:process_option))
+                   .flatten(1)
+  end
+
+  def run
+    STDERR.puts('Simulating...') if dry_run?
+
+    git_clone  or raise 'clone failed'
+    post_clone or raise 'post clone triggers failed'
+  end
+
+  def ssh_command(ssh = 'ssh')
+    return ssh unless identity.file
+
+    "#{ssh} -i #{identity.file} -o IdentitiesOnly=yes"
+  end
+
+  private
+
+  def add_ssh(env)
+    env.tap do |env|
+      'GIT_SSH_COMMAND'.then { env[it] = ssh_command(env.fetch(it, 'ssh')) }
+    end
+  end
+
+  def options_config_path
+    options.delete('--identities-config') || Config::DEFAULT_PATH
+  end
+
+  def post_clone
+    exec_in_repo do
+      git_config 'user.name',  identity.name  if identity.name
+      git_config 'user.email', identity.email if identity.email
+
+      identity.file&.then do |file|
+        git_config 'core.sshcommand' => ssh_command,
+                   'user.signingkey' => file,
+                   'gpg.format' => 'ssh',
+                   'commit.gpgsign' => true
+      end
+    end
+  end
+
+  def process_option(opt)
+    case opt
+    in [name, '', GetoptLong::NO_ARGUMENT | GetoptLong::OPTIONAL_ARGUMENT]
+      [name]
+    in [name, value, _]
+      [name, value]
+    end
+  end
+
+  def select_identity = config.dispatcher.(repo_data)
+end
+
+options = GetoptLong.new(*GETOPTLONG_CONF).to_enum(:each).to_h
+GitCloneAs.run(ARGV.dup, options:)
