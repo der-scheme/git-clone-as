@@ -15,6 +15,9 @@ class Pathname
 
     yield self
   end
+
+  def git_root? = self./('.git').directory?
+  def in_git? = ascend.find(&:git_root?)
 end
 
 CLONE_OPTIONS = {
@@ -183,7 +186,9 @@ class Dispatcher
 end
 
 class Config
-  DEFAULT_PATH = Pathname.home./('.local/share/git-clone-as/config.rb').freeze
+  FILENAME = 'config.rb'
+  DEFAULT_PATH = Pathname.home./(".local/share/git-clone-as/#{FILENAME}").freeze
+  USR_SHARE_PATH = Pathname.new("/usr/share/git-clone-as/#{FILENAME}").freeze
 
   class << self
     def load(file) = Config.new.load(file)
@@ -209,7 +214,8 @@ class Config
     identities[identity.id] = identity
   end
 
-  def load(file = DEFAULT_PATH)
+  def load(file = nil)
+    file ||= locate_config_file
     Pathname.new(file).expand_path.then do |file|
       wrap_module.module_eval(file.read, file.to_s)
     end
@@ -224,6 +230,18 @@ class Config
   end
 
   private
+
+  def locate_config_file
+    return DEFAULT_PATH if DEFAULT_PATH.file?
+
+    source_parent_dir = Pathname.new(__dir__).parent
+    candidate_path    = source_parent_dir / FILENAME
+
+    return candidate_path if candidate_path.file? && source_parent_dir.git_root?
+    return USR_SHARE_PATH if USR_SHARE_PATH.file?
+
+    raise 'could not locate default config location'
+  end
 
   def wrap_module
     Module.new do
@@ -431,7 +449,7 @@ class GitCloneAs
   end
 
   def options_config_path
-    options.delete('--identities-config') || Config::DEFAULT_PATH
+    options.delete('--identities-config')
   end
 
   def post_clone
