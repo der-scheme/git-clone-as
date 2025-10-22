@@ -12,6 +12,8 @@ git clone-as --dry-run git@github.com:username/project.git
 ## Configuration
 Download file `config.rb` to `~/.local/share/git-clone-as/config.rb`, or pass `--identities-config path/to/config.rb` to `git clone-as`.
 
+If you have a directory where all your cloned repositories live, and if you want `git-clone-as` to always clone to that directory, you can specify it via the `g.root` method.
+
 Define your identities with the `g.identity` method. By default, this will also define a matcher that connects the identity with repositories owned by that user, which can explicitly enabled or disabled with the `define_matcher` keyword argument.
 
 Define your custom matchers with the `g.match` method. The supported matchers are:

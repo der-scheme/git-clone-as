@@ -9,7 +9,7 @@ class Pathname
   def self.home(...) = new(Dir.home(...))
 
   def absolute_path(*)
-    realpath(*)
+    expand_path(*)
   rescue Errno::ENOENT => error
     raise error unless block_given?
 
@@ -217,6 +217,12 @@ class Config
     self
   end
 
+  def root(path = nil)
+    return @root unless path
+
+    @root = path
+  end
+
   private
 
   def wrap_module
@@ -319,7 +325,6 @@ class GitCloneAs
   def self.run(...) = new(...).run
 
   attr_accessor :options, :url
-  attr_writer :directory
 
   def initialize(argv, options: {})
     self.url = argv.shift
@@ -333,8 +338,13 @@ class GitCloneAs
     @config ||= Config.load(options_config_path)
   end
 
+  def directory=(dir)
+    @directory = Pathname.new(dir) if dir
+  end
+
   def directory
-    @directory ||= project
+    (@directory ||= Pathname.new(project))
+      .expand_path(config.root)
   end
   alias target_dir directory
 

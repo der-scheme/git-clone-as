@@ -1,6 +1,8 @@
 # frozen-string-literal: true
 
 configure do |g|
+  g.root '/home/username/code'
+
   g.identity user: 'username', host: 'github.com',  name: 'Real Name',
              email: '1234567+username@users.noreply.github.com',
              file: 'id_username_github.com_ed25519.pub'
