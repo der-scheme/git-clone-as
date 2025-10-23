@@ -37,12 +37,12 @@ Each of those, except the last one, takes a single argument that has to respond 
 
 Multiple matchers can be composed with the following operators:
 <dl>
-  <dt>|</dt>
+  <dt>&</dt>
   <dd>Matches if both matchers match ("and").</dd>
-  <dt>+</dt>
+  <dt>|</dt>
   <dd>Matches if at least one matcher matches ("or")</dd>
-  <dt>-</dt>
-  <dd>Matches if the first, but not the second matcher matches ("and not")</dd>
+  <dt>!</dt>
+  <dd>Inverts a match ("not"). Aliased as `~`.</dd>
 </dl>
 
 ## Examples

@@ -113,7 +113,7 @@ class Identity
     [
       user&.then { Matchers.user(it) },
       host&.then { Matchers.host(it) }
-    ].compact.reduce(&:|)
+    ].compact.reduce(&:&)
   end
 
   def name
@@ -133,9 +133,10 @@ class Matcher
 
   def ===(other) = match?(other) || super
 
-  def |(other) = new(self) { pattern.match?(it) && other.match?(it) }
-  def +(other) = new(self) { pattern.match?(it) || other.match?(it) }
-  def -(other) = new(self) { pattern.match?(it) && !other.match?(it) }
+  def &(other) = new(self) { pattern.match?(it) && other.match?(it) }
+  def |(other) = new(self) { pattern.match?(it) || other.match?(it) }
+  def !        = new(self) { !pattern.match?(it) }
+  def ~        = !self
 
   def match?(arg)    = pattern === transform(arg)
   def new(...)       = self.class.new(...)
