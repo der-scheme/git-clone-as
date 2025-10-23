@@ -9,7 +9,7 @@ class Pathname
   def self.home(...) = new(Dir.home(...))
 
   def absolute_path(*)
-    expand_path(*)
+    realpath(*)
   rescue Errno::ENOENT => error
     raise error unless block_given?
 
