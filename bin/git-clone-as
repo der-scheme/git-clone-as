@@ -74,7 +74,6 @@ class GitURLParser
   REGEX = %r{\A(?:#{_SCP}|#{_SSH}|#{_OTHER})\z}.freeze
 
   attr_accessor :url
-  alias to_s url
 
   def initialize(url)
     self.url = url
@@ -89,6 +88,8 @@ class GitURLParser
   def project    = match_data[:project]
   def repository = match_data[:repository]
   def user       = match_data[:user]
+
+  def to_s = url
 end
 
 class Identity
@@ -245,8 +246,8 @@ end
 
 class Environment
   class << self
-    def command(...) = Command.run(...)
-    def dry(...) = Dry.new(...)
+    def cmd(env, ...) = env.cmd(...)
+    def dry(...)      = Dry.new(...)
   end
 
   attr_accessor :dry_keys, :env
@@ -256,79 +257,48 @@ class Environment
     self.dry_keys = dry
   end
 
-  def dry(...)
-    (@dry ||= self.class.dry(dry_keys ? env.slice(*dry_keys) : env))
-      .run(...)
+  def all = self
+
+  def dry
+    @dry ||= self.class.dry(dry_keys ? env.slice(*dry_keys) : env)
   end
 
-  def empty(...)
-    (@empty ||= new({})).run(...)
+  def empty
+    @empty ||= new({})
   end
 
+  def new(...) = self.class.new(...)
+  def none     = dry.empty
+
+  def dry?   = false
   def empty? = env.empty?
 
-  def command(...) = self.class.command(self, ...)
-  def new(...)     = self.class.new(...)
-  def none(...)    = dry.empty(...)
-
-  def run(lambda = nil, &block)
-    return self unless block or lambda
-
-    command(&block || lambda)
+  def cmd(*args)
+    dry.cmd(*args)
+    system(@env, *args.map(&:to_s))
   end
-  alias all run
 
-  def to_h(&block)
-    return @env unless block
-
-    @env.to_h(&block)
-  end
-  alias to_hash to_h
+  def to_h(...) = env.to_h(...)
+  def to_hash   = to_h
 end
 
 class Environment
   class Dry < self
-    def self.command(...) = Command::Dry.run(...)
+    def dry = self
 
-    alias dry run
+    def dry? = true
+
+    def cmd(*args)
+      STDERR.print(to_s, ' ') unless empty?
+
+      STDERR.puts(::Shellwords.shelljoin(args))
+
+      true
+    end
 
     def to_s
       env.map { |var, value| "#{var}=#{Shellwords.shellescape(value)}" }
          .join(' ')
-    end
-  end
-end
-
-class Command < BasicObject
-  def self.run(*args, **opts, &cmdline)
-    cmdline = args.shift unless cmdline
-
-    new(*args, **opts).__run__(&cmdline)
-  end
-
-  def initialize(env)
-    @env = env
-  end
-
-  def method_missing(*args)
-    @env.dry ->(run) { run.__send__(*args) }
-
-    ::Kernel.system(@env, *args.map(&:to_s))
-  end
-
-  def __run__(&block) = block.(self)
-end
-
-class Command
-  class Dry < self
-    def initialize(env) = super(env.dry)
-
-    def method_missing(*args)
-      ::STDERR.print(@env.to_s, ' ') unless @env.empty?
-
-      ::STDERR.puts(::Shellwords.shelljoin(args))
-
-      true
     end
   end
 end
@@ -364,14 +334,13 @@ class GitCloneAs
     @dry_run ||= options.delete('--dry-run')
   end
 
-  def env(...)
-    return @env.run(...) if @env
+  def env
+    return @env if @env
 
     @env = Environment.new(add_ssh(ENV.to_h), dry: ['GIT_SSH_COMMAND'])
-    return @env.run(...) unless dry_run?
+    return @env unless dry_run?
 
     @env = @env.dry
-    @env.run(...)
   end
 
   def identity
@@ -390,23 +359,23 @@ class GitCloneAs
   def exec_in_repo(&block)
     original_dir = Pathname.pwd
 
-    env.none ->(run) { run.cd target_dir }
+    env.none.cmd(:cd, target_dir)
 
     return block.() if dry_run?
 
     Dir.chdir(target_dir, &block)
   ensure
-    env.none ->(run) { run.cd original_dir }
+    env.none.cmd(:cd, original_dir)
   end
 
   def git_clone(*args)
     args = [url, target_dir] if args.empty?
 
-    env ->(run) { run.git 'clone', *git_options, *args }
+    env.cmd(:git, :clone, *git_options, *args)
   end
 
   def git_config(*args, **kvs)
-    return env.empty ->(run) { run.git 'config', *args } if kvs.empty?
+    return env.empty.cmd(:git, :config, *args) if kvs.empty?
 
     unless args.empty? || kvs.empty?
       raise ArgumentError, 'both arg list and key-value pairs given'
