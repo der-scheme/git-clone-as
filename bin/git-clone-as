@@ -10,14 +10,14 @@ class Pathname
 
   def absolute_path(*)
     realpath(*)
-  rescue Errno::ENOENT => error
-    raise error unless block_given?
+  rescue Errno::ENOENT
+    raise unless block_given?
 
     yield self
   end
 
   def git_root? = self./('.git').directory?
-  def in_git? = ascend.find(&:git_root?)
+  def in_git?   = ascend.find(&:git_root?)
 end
 
 CLONE_OPTIONS = {
@@ -67,39 +67,45 @@ class GitURLParser
   _PATH = "(?<path>.+)"
   _REPO_PATH = "(?:#{_GITHUB_REPO}|#{_PATH})"
   _PORT = "(?::(?<port>\d+))?"
-  # REGEX = %r{\A(?<ssh>ssh://)?+#{_USER_AT_HOST}(?(<ssh>)#{_PORT}/|:/?)(?:#{_GITHUB_REPO}|#{_PATH})\z}.freeze
   _SCP = "#{_USER_AT_HOST}:/?#{_REPO_PATH}"
   _SSH = "(?<protocol>ssh)://#{_USER_AT_HOST}#{_PORT}/#{_REPO_PATH}"
   _OTHER = "(?<protocol>git|https?|ftps?)://#{_DOMAIN}#{_PORT}/#{_REPO_PATH}"
+
   REGEX = %r{\A(?:#{_SCP}|#{_SSH}|#{_OTHER})\z}.freeze
 
   attr_accessor :url
+  alias to_s url
 
   def initialize(url)
     self.url = url
-  end
-
-  # Define a bunch of reader methods.
-  %i[host path project repository user].each do |method|
-    module_eval "def #{method} = match_data[:#{method}]", __FILE__, __LINE__
   end
 
   def match_data
     @match_data ||= REGEX.match(url) or raise 'not a Git URL'
   end
 
-  def to_s = url
+  def host       = match_data[:host]
+  def path       = match_data[:path]
+  def project    = match_data[:project]
+  def repository = match_data[:repository]
+  def user       = match_data[:user]
 end
 
 class Identity
-  Fields = %i[email file host name user].freeze
-
-  attr_reader :id, *Fields
+  attr_accessor :id, :email, :host, :user
+  attr_reader :file
   alias identity_file file
+  attr_writer :name
 
   def initialize(id = nil, **kwargs)
     kwargs.each { |name, value| __send__ "#{name}=", value }
+
     self.id = id || [user, host].join('@')
+  end
+
+  def file=(file)
+    @file =
+      Pathname.new(file).absolute_path { it.realpath(Pathname.home / '.ssh') }
   end
 
   def matcher
@@ -112,15 +118,6 @@ class Identity
   def name
     @name ||= user
   end
-
-  private
-
-  attr_writer :id, *Fields
-
-  def file=(file)
-    @file =
-      Pathname.new(file).absolute_path { it.realpath(Pathname.home / '.ssh') }
-  end
 end
 
 class Matcher
@@ -128,8 +125,9 @@ class Matcher
 
   def initialize(pattern = nil, transform_proc: nil, &matcher)
     self.pattern = pattern
-    transform_proc&.then { define_singleton_method(:transform, &it) }
-    matcher&.then { define_singleton_method(:match?, &it) }
+
+    define_singleton_method(:transform, &transform_proc) if transform_proc
+    define_singleton_method(:match?,    &matcher)        if matcher
   end
 
   def ===(other) = match?(other) || super
@@ -138,40 +136,34 @@ class Matcher
   def +(other) = new(self) { pattern.match?(it) || other.match?(it) }
   def -(other) = new(self) { pattern.match?(it) && !other.match?(it) }
 
-  def match?(arg) = pattern === transform(arg)
-  def new(...) = self.class.new(...)
-  def to_proc = method(:match?).to_proc
+  def match?(arg)    = pattern === transform(arg)
+  def new(...)       = self.class.new(...)
+  def to_proc        = method(:match?).to_proc
   def transform(obj) = obj
 end
 
 module Matchers
   extend self
 
-  # Define a bunch of matchers
-  {
-    host: :hostname,
-    path: nil,
-    project: %i[repo_name reponame],
-    repository: %i[repo_path repository_path],
-    url: nil,
-    user: :username
-  }.each do |method, aliases|
-    module_eval <<~END, __FILE__, __LINE__ + 1
-      def #{method}(#{method})
-        Matcher.new(#{method}, transform_proc: proc(&:#{method}))
-      end
-    END
-
-    [*aliases].each { module_eval "alias #{it} #{method}", __FILE__, __LINE__ }
+  def self.matcher(name)
+    define_method(name) { |arg| Matcher.new(arg, transform_proc: proc(&name)) }
   end
 
   def __default__(...) = Matcher.new { |_| true }
+
+  matcher :host
+  matcher :path
+  matcher :project
+  matcher :repository
+  matcher :url
+  matcher :user
 end
 
 class Dispatcher
   def call(url_data)
     mappers.lazy.each_with_object(url_data)
-           .map(&:call).find(&:itself) or raise 'failed to match repository'
+           .map(&:call)
+           .find(&:itself) or raise 'failed to match repository'
   end
 
   def define(matcher:, identity:)
@@ -215,10 +207,8 @@ class Config
   end
 
   def load(file = nil)
-    file ||= locate_config_file
-    Pathname.new(file).expand_path.then do |file|
-      wrap_module.module_eval(file.read, file.to_s)
-    end
+    file = Pathname.new(file || locate_config_file).realpath
+    wrap_module.module_eval(file.read, file.to_s)
 
     self
   end
@@ -244,27 +234,16 @@ class Config
   end
 
   def wrap_module
-    Module.new do
+    mod = Module.new do
       extend Matchers
       def self.configure = yield const_get(:CONFIGURATION)
-    end.tap do |mod|
-      mod.const_set(:CONFIGURATION, self)
     end
+
+    mod.tap { it.const_set(:CONFIGURATION, self) }
   end
 end
 
 class Environment
-  class Dry < self
-    def self.command(...) = Command::Dry.run(...)
-
-    def dry(...) = run(...) # alias doesn't work
-
-    def to_s
-      env.map { |var, value| "#{var}=#{Shellwords.shellescape(value)}" }
-         .join(' ')
-    end
-  end
-
   class << self
     def command(...) = Command.run(...)
     def dry(...) = Dry.new(...)
@@ -273,7 +252,7 @@ class Environment
   attr_accessor :dry_keys, :env
 
   def initialize(env = {}, dry: nil)
-    self.env = env
+    self.env      = env
     self.dry_keys = dry
   end
 
@@ -289,8 +268,8 @@ class Environment
   def empty? = env.empty?
 
   def command(...) = self.class.command(self, ...)
-  def new(...) = self.class.new(...)
-  def none(...) = dry.empty(...)
+  def new(...)     = self.class.new(...)
+  def none(...)    = dry.empty(...)
 
   def run(lambda = nil, &block)
     return self unless block or lambda
@@ -307,19 +286,20 @@ class Environment
   alias to_hash to_h
 end
 
-class Command < BasicObject
+class Environment
   class Dry < self
-    def initialize(env) = super(env.dry)
+    def self.command(...) = Command::Dry.run(...)
 
-    def method_missing(*args)
-      ::STDERR.print(@env.to_s, ' ') unless @env.empty?
+    alias dry run
 
-      ::STDERR.puts(::Shellwords.shelljoin(args))
-
-      true
+    def to_s
+      env.map { |var, value| "#{var}=#{Shellwords.shellescape(value)}" }
+         .join(' ')
     end
   end
+end
 
+class Command < BasicObject
   def self.run(*args, **opts, &cmdline)
     cmdline = args.shift unless cmdline
 
@@ -339,15 +319,29 @@ class Command < BasicObject
   def __run__(&block) = block.(self)
 end
 
+class Command
+  class Dry < self
+    def initialize(env) = super(env.dry)
+
+    def method_missing(*args)
+      ::STDERR.print(@env.to_s, ' ') unless @env.empty?
+
+      ::STDERR.puts(::Shellwords.shelljoin(args))
+
+      true
+    end
+  end
+end
+
 class GitCloneAs
   def self.run(...) = new(...).run
 
   attr_accessor :options, :url
 
   def initialize(argv, options: {})
-    self.url = argv.shift
+    self.url       = argv.shift
     self.directory = argv.shift
-    self.options = options
+    self.options   = options
 
     raise 'too many arguments on the cmdline' unless argv.empty?
   end
@@ -371,12 +365,13 @@ class GitCloneAs
   end
 
   def env(...)
-    (@env ||= Environment.new(add_ssh(ENV.to_h), dry: ['GIT_SSH_COMMAND'])
-                         .then do |env|
-                           next env unless dry_run?
+    return @env.run(...) if @env
 
-                           env.dry
-                         end).run(...)
+    @env = Environment.new(add_ssh(ENV.to_h), dry: ['GIT_SSH_COMMAND'])
+    return @env.run(...) unless dry_run?
+
+    @env = @env.dry
+    @env.run(...)
   end
 
   def identity
@@ -397,7 +392,7 @@ class GitCloneAs
 
     env.none ->(run) { run.cd target_dir }
 
-    return block.call if dry_run?
+    return block.() if dry_run?
 
     Dir.chdir(target_dir, &block)
   ensure
@@ -444,7 +439,8 @@ class GitCloneAs
 
   def add_ssh(env)
     env.tap do |env|
-      'GIT_SSH_COMMAND'.then { env[it] = ssh_command(env.fetch(it, 'ssh')) }
+      key      = 'GIT_SSH_COMMAND'
+      env[key] = ssh_command(env.fetch(key, 'ssh'))
     end
   end
 
@@ -460,8 +456,8 @@ class GitCloneAs
       identity.file&.then do |file|
         git_config 'core.sshcommand' => ssh_command,
                    'user.signingkey' => file,
-                   'gpg.format' => 'ssh',
-                   'commit.gpgsign' => true
+                   'gpg.format'      => 'ssh',
+                   'commit.gpgsign'  => true
       end
     end
   end
