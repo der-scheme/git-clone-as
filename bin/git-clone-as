@@ -71,7 +71,7 @@ class GitURLParser
   _SSH = "(?<protocol>ssh)://#{_USER_AT_HOST}#{_PORT}/#{_REPO_PATH}"
   _OTHER = "(?<protocol>git|https?|ftps?)://#{_DOMAIN}#{_PORT}/#{_REPO_PATH}"
 
-  REGEX = %r{\A(?:#{_SCP}|#{_SSH}|#{_OTHER})\z}.freeze
+  REGEX = %r{\A(?:#{_SSH}|#{_OTHER}|#{_SCP})\z}.freeze
 
   attr_accessor :url
 
