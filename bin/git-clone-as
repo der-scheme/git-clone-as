@@ -349,7 +349,8 @@ class GitCloneAs
   end
 
   def project
-    @project ||= repo_data.project
+    @project ||= repo_data.project ||
+                 File.basename(repo_data.path.sub(%r{\.git/?\z}, ''))
   end
 
   def repo_data
